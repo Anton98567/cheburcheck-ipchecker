@@ -166,7 +166,8 @@ BLOCKED_F="$OUTDIR/blocked.txt"
 CLEAN_F="$OUTDIR/clean.txt"
 ERRORS_F="$OUTDIR/errors.txt"
 UNSTABLE_F="$OUTDIR/unstable.txt"
-: > "$TSV"; : > "$BLOCKED_F"; : > "$CLEAN_F"; : > "$ERRORS_F"; : > "$UNSTABLE_F"
+UNKNOWN_F="$OUTDIR/unknown.txt"
+: > "$TSV"; : > "$BLOCKED_F"; : > "$CLEAN_F"; : > "$ERRORS_F"; : > "$UNSTABLE_F"; : > "$UNKNOWN_F"
 if [[ $CSV -eq 1 ]]; then
   printf 'target,status,blocked,asn,organisation,cdn,blocked_subnets,detail\n' > "$CSV_FILE"
 fi
@@ -400,8 +401,9 @@ apply_probe() {
         return 0
         ;;
       *)
-        # nodata: зонды молчат (обычно лимит сервиса) — свежий id и лёгкий повтор,
-        # затем финальный вердикт выносит список (100% CLEAN/BLOCKED)
+        # nodata: зонды не дали вердикта — СТРОГО зонды: адрес НЕ помечаем
+        # CLEAN/BLOCKED по спискам, ставим UNKNOWN (перепроверить позже);
+        # старый вердикт списка сохраняем в detail для справки
         tries=$((tries + 1))
         if [[ $tries -eq 1 ]]; then
           sleep 2
@@ -409,8 +411,10 @@ apply_probe() {
           continue
         fi
         row=$(printf '%s' "$row" \
-          | awk -F'\t' -v n="probe:no_response" 'BEGIN{OFS="\t"}
-              { if ($8=="") $8=n; else $8=$8";"n; print }')
+          | awk -F'\t' 'BEGIN{OFS="\t"}
+              { ls=$2; $2="UNKNOWN"; $3="";
+                n="probe:no_response;list=" ls;
+                if ($8=="") $8=n; else $8=$8";"n; print }')
         printf '%s\n' "$row"
         return 0
         ;;
@@ -646,6 +650,7 @@ if [[ $PROBE -eq 1 ]]; then
           BLOCKED)  printf '%s%s%s %s\n' "$C_RED" "[BLOCKED]" "$C_RST" "$t" ;;
           CLEAN)    printf '%s%s%s %s\n' "$C_GRN" "[CLEAN]  " "$C_RST" "$t" ;;
           UNSTABLE) printf '%s%s%s %s\n' "$C_YEL" "[UNSTABLE]" "$C_RST" "$t" ;;
+          UNKNOWN)  printf '%s%s%s %s\n' "$C_YEL" "[UNKNOWN]" "$C_RST" "$t" ;;
           *)        printf '%s%s%s %s\n' "$C_YEL" "[ERROR]  " "$C_RST" "$t" ;;
         esac
       fi
@@ -669,6 +674,7 @@ else
         BLOCKED)  printf '%s%s%s %s\n' "$C_RED" "[BLOCKED]" "$C_RST" "$t" ;;
         CLEAN)    printf '%s%s%s %s\n' "$C_GRN" "[CLEAN]  " "$C_RST" "$t" ;;
         UNSTABLE) printf '%s%s%s %s\n' "$C_YEL" "[UNSTABLE]" "$C_RST" "$t" ;;
+        UNKNOWN)  printf '%s%s%s %s\n' "$C_YEL" "[UNKNOWN]" "$C_RST" "$t" ;;
         *)        printf '%s%s%s %s\n' "$C_YEL" "[ERROR]  " "$C_RST" "$t" ;;
       esac
     fi
@@ -679,6 +685,7 @@ cut -f1,2 "$TSV" | awk -F'\t' '$2=="BLOCKED"{print $1}' > "$BLOCKED_F"
 cut -f1,2 "$TSV" | awk -F'\t' '$2=="CLEAN"{print $1}'   > "$CLEAN_F"
 cut -f1,2 "$TSV" | awk -F'\t' '$2=="ERROR"{print $1}'   > "$ERRORS_F"
 cut -f1,2 "$TSV" | awk -F'\t' '$2=="UNSTABLE"{print $1}' > "$UNSTABLE_F"
+cut -f1,2 "$TSV" | awk -F'\t' '$2=="UNKNOWN"{print $1}'  > "$UNKNOWN_F"
 # нестабильные (были оба исхода) также попадают в blocked.txt как «требует внимания»
 cat "$UNSTABLE_F" >> "$BLOCKED_F"
 
@@ -691,12 +698,14 @@ n_blk=$(wc -l < "$BLOCKED_F" | tr -d ' ')
 n_cln=$(wc -l < "$CLEAN_F"   | tr -d ' ')
 n_err=$(wc -l < "$ERRORS_F"  | tr -d ' ')
 n_uns=$(wc -l < "$UNSTABLE_F" | tr -d ' ')
+n_unk=$(wc -l < "$UNKNOWN_F" | tr -d ' ')
 
 echo
 echo "${C_CYN}═══ ИТОГ ═══${C_RST}"
 printf '  %sзаблокировано:%s %s\n' "$C_RED" "$C_RST" "$((n_blk - n_uns))"
 [[ "$n_uns" -gt 0 ]] && printf '  %sнестабильно:%s   %s (проверить повторно)\n' "$C_YEL" "$C_RST" "$n_uns"
 printf '  %sчисто:%s       %s\n'   "$C_GRN" "$C_RST" "$n_cln"
+[[ "$n_unk" -gt 0 ]] && printf '  %sне проверено:%s %s (зонды недоступны — см. unknown.txt)\n' "$C_YEL" "$C_RST" "$n_unk"
 printf '  %sошибки:%s      %s\n'   "$C_YEL" "$C_RST" "$n_err"
 echo
 echo "Отчёт: $TSV"
@@ -704,8 +713,9 @@ echo "Отчёт: $TSV"
 echo "Блок:  $BLOCKED_F"
 echo "Чисто: $CLEAN_F"
 [[ "$n_uns" -gt 0 ]] && echo "UNSTABLE: $UNSTABLE_F"
+[[ "$n_unk" -gt 0 ]] && echo "UNKNOWN (зонды не ответили, перепроверить): $UNKNOWN_F"
 [[ "$n_err" -gt 0 ]] && echo "Ошибки (можно перепроверить): $ERRORS_F"
 
-# код выхода: 1 = есть заблокированные, нестабильные или ошибки (удобно для CI)
-[[ "$n_blk" -gt 0 || "$n_uns" -gt 0 || "$n_err" -gt 0 ]] && exit 1
+# код выхода: 1 = есть заблокированные, нестабильные, непроверенные или ошибки
+[[ "$n_blk" -gt 0 || "$n_uns" -gt 0 || "$n_unk" -gt 0 || "$n_err" -gt 0 ]] && exit 1
 exit 0
