@@ -24,6 +24,8 @@ DELAY=0.3             # пауза каждой воркер-границы, с�
 VERIFY=1              # проверок на один адрес (1 = один снимок; 2+ = повторная верификация)
 PROBE=1               # динамическая проверка зондами ТСПУ — ПО УМОЛЧАНИЮ ВКЛЮЧЕНА (-p); отключить: --no-probe
 PROBE_TIMEOUT=120     # сколько ждать ответы зондов, сек (при неполном ответе — reconnect)
+PROBE_JOBS=1          # параллельность ЗОНДОВ: 1 = последовательно (надёжно, не упирается в лимиты);
+                      # >1 = быстрее на больших списках, но возможны nodata → вердикт по спискам
 CSV=1                 # писать results.csv
 QUIET=0
 
@@ -53,6 +55,8 @@ usage() {
              Отключить: --no-probe
                 --no-probe          отключить зонды (только списки РКН/CDN)
                 --probe-timeout SEC сколько ждать ответы зондов (по умолчанию: $PROBE_TIMEOUT)
+                --probe-jobs N      параллельно зондов на больших списках (по умолчанию: 1 =
+                                    последовательно/надёжно; напр. 3-5 заметно быстрее)
   -q         тихий режим (только итог)
   -h         эта справка
 
@@ -66,13 +70,17 @@ EOF
 }
 
 # ---------- разбор аргументов ----------
-# длинная опция --probe-timeout SEC обрабатывается до getopts и убирается из аргументов
+# длинные опции --probe-* обрабатываются до getopts и убираются из аргументов
 ARGS=()
-for a in "$@"; do
+while (( $# > 0 )); do
+  a="$1"; shift
   case "$a" in
+    --probe-timeout) PROBE_TIMEOUT="$1"; shift ;;
     --probe-timeout=*) PROBE_TIMEOUT="${a#*=}" ;;
-    --no-probe)        PROBE=0 ;;
-    --no-probe=*)      PROBE=0 ;;
+    --probe-jobs)    PROBE_JOBS="$1"; shift ;;
+    --probe-jobs=*)  PROBE_JOBS="${a#*=}" ;;
+    --no-probe)      PROBE=0 ;;
+    --no-probe=*)    PROBE=0 ;;
     *) ARGS+=("$a") ;;
   esac
 done
@@ -102,6 +110,8 @@ fi
 [[ "$JOBS" -lt 1 ]] && JOBS=1
 [[ "$JOBS" -gt 8 ]] && JOBS=8
 [[ "$VERIFY" -lt 1 ]] && VERIFY=1
+[[ "$PROBE_JOBS" -lt 1 ]] && PROBE_JOBS=1
+[[ "$PROBE_JOBS" -gt 20 ]] && PROBE_JOBS=20
 
 # ---------- зависимости ----------
 command -v curl >/dev/null || { echo "нужен curl" >&2; exit 1; }
@@ -236,9 +246,9 @@ poll_target() {
       return 0
     fi
 
-    # ошибки, при которых есть смысл повторить
+    # ошибки, при которых есть смысл повторить (429/503/502/500/пусто) — с нарастающей паузой
     if [[ "$code" == "429" || "$code" == "503" || "$code" == "502" || "$code" == "500" || -z "$code" ]]; then
-      sleep_s=$(( attempt * 2 ))
+      sleep_s=$(( attempt * 3 ))
       sleep "$sleep_s"
       attempt=$(( attempt + 1 ))
       continue
@@ -283,7 +293,7 @@ except Exception: print("")' 2>/dev/null || echo ""
 # с возрастающей паузой (лимиты сервиса). Отдаёт сводку:
 #  verdict=<число>;...|votes=<N>|online=<M>
 run_probe() {
-  local id="$1" tmp tries=0 max_tries=4
+  local id="$1" tmp tries=0 max_tries=3
   [[ -z "$id" ]] && { echo ""; return 0; }
   tmp=$(mktemp "${RESULTS_DIR}/probe.XXXXXX")
   while [[ $tries -lt $max_tries ]]; do
@@ -291,13 +301,21 @@ run_probe() {
          -H 'Accept: text/event-stream' \
          -H 'User-Agent: check-ips.sh/2.0 probe' \
          -- "$PROBE_API/$id" > "$tmp" 2>/dev/null
+    # мгновенный отказ сервиса (429/ошибка/пусто) — реконнекты бессмысленны,
+    # вердикт вынесет список; не тратим НИ СЕКУНДЫ на повторные подключения
+    if grep -qE '"code"[[:space:]]*:[[:space:]]*[45][0-9]{2}|event:error' "$tmp" 2>/dev/null \
+       || [[ ! -s "$tmp" ]]; then
+      echo ""
+      rm -f "$tmp"
+      return 0
+    fi
     # успех: сервер прислал финальный done ИЛИ хотя бы какие-то вердикты
     if grep -q 'event:result' "$tmp" 2>/dev/null; then
       break
     fi
-    # тишина (лимит/очередь/обрыв) — переподключаемся к тому же id после паузы
+    # тишина (очередь/обрыв) — переподключаемся к тому же id после короткой паузы
     tries=$((tries + 1))
-    [[ $tries -lt $max_tries ]] && sleep $(( tries * 5 ))
+    [[ $tries -lt $max_tries ]] && sleep 3
   done
   # подсчёт вердиктов по строкам data: (малыми порциями, чтобы не съесть память)
   awk '/^data:/{ a=substr($0,6); if (index(a,"verdicts")>0) print a }' "$tmp" \
@@ -382,12 +400,12 @@ apply_probe() {
         return 0
         ;;
       *)
-        # nodata: зонды молчат — свежий id запроса и ещё одна попытка,
+        # nodata: зонды молчат (обычно лимит сервиса) — свежий id и лёгкий повтор,
         # затем финальный вердикт выносит список (100% CLEAN/BLOCKED)
         tries=$((tries + 1))
         if [[ $tries -eq 1 ]]; then
-          sleep 5
-          id=$(id_of "$(poll_target "$(printf '%s' "$row" | cut -f1)" || true)")
+          sleep 2
+          id=$(id_of "$(RETRIES=1 poll_target "$(printf '%s' "$row" | cut -f1)" || true)")
           continue
         fi
         row=$(printf '%s' "$row" \
@@ -399,6 +417,20 @@ apply_probe() {
     esac
   done
   printf '%s\n' "$row"
+}
+
+# для ПАРАЛЛЕЛЬНОЙ фазы зондов: принимает строку целиком, где последняя
+# колонка = id запроса; прогоняет apply_probe и печатает итоговую строку
+apply_probe_line() {
+  local line="$1" nf id row
+  if [[ -z "$line" ]]; then return 0; fi
+  nf=$(printf '%s' "$line" | awk -F'\t' '{print NF}')
+  id=$(printf '%s' "$line" | cut -f"$nf")
+  if [[ "$nf" -le 1 ]]; then
+    printf '%s\n' "$line"; return 0
+  fi
+  row=$(printf '%s' "$line" | cut -f1-$((nf - 1)))
+  printf '%s\n' "$(apply_probe "$row" "$id")"
 }
 
 # ---------- проверка адреса с верификацией (VERIFY опросов) ----------
@@ -486,7 +518,7 @@ worker() {
   fi
   sleep "$DELAY"
 }
-export -f worker check_one parse_json poll_target blocked_of id_of run_probe probe_verdict 2>/dev/null || true
+export -f worker check_one parse_json poll_target blocked_of id_of run_probe probe_verdict apply_probe apply_probe_line 2>/dev/null || true
 export API_BASE PROBE_API RETRIES TIMEOUT DELAY VERIFY PROBE PROBE_TIMEOUT QUIET HAVE_JQ HAVE_PY
 export C_RED C_GRN C_YEL C_RST
 export RESULTS_DIR
@@ -507,44 +539,141 @@ if [[ -n "$DB_UPDATE" ]]; then
   fi
 fi
 
-# xargs -P: параллельно, по одной строке
+# ---------- ЭТАП 1: списки (параллельно) ----------
+start1=$(date +%s)
+# «живой» счётчик этапа 1 — чтобы при большом списке было видно, что идёт работа
+ticker1=""
+if [[ $PROBE -eq 1 && $QUIET -eq 0 && -t 1 ]]; then
+  (
+    while :; do
+      n=$(wc -l < "$RESULTS_DIR/parts.log" 2>/dev/null | tr -d ' ')
+      el=$(( $(date +%s) - start1 ))
+      printf '%s[списки %d/%d · %02d:%02d]%s\033[K\r' \
+        "$C_DIM" "${n:-0}" "$TOTAL" $((el / 60)) $((el % 60)) "$C_RST"
+      sleep 1
+    done
+  ) &
+  ticker1=$!
+fi
 printf '%s\n' "$TARGETS" \
   | xargs -P "$JOBS" -I{} -n1 bash -c 'worker "$@"' _ {}
+if [[ -n "$ticker1" ]]; then kill "$ticker1" 2>/dev/null; wait "$ticker1" 2>/dev/null; fi
+[[ $QUIET -eq 0 && -t 1 ]] && printf '\033[K\r'
 
-# ---------- сбор и сортировка результатов ----------
-# parts.log мог прийти не по порядку — восстановим порядок входного списка.
-# При зондах здесь же выполняется ВТОРАЯ (последовательная) фаза проверки.
+# ---------- ЭТАП 2: зонды + сборка в порядке входного списка ----------
 : > "$TSV"
-i=0
-while IFS= read -r t; do
-  i=$((i + 1))
-  line=$(awk -F'\t' -v t="$t" '$1 == t { print; exit }' "$RESULTS_DIR/parts.log")
-  if [[ -z "$line" ]]; then
-    row=$(printf '%s\tERROR\t\t\t\t\t\tmissing_result' "$t")
-    id=""
+if [[ $PROBE -eq 1 ]]; then
+  if [[ "$PROBE_JOBS" -le 1 ]]; then
+    # ---- последовательно: проверяем и печатаем по мере готовности ----
+    start2=$(date +%s)
+    i=0
+    while IFS= read -r t; do
+      i=$((i + 1))
+      line=$(awk -F'\t' -v t="$t" '$1 == t { print; exit }' "$RESULTS_DIR/parts.log")
+      if [[ -z "$line" ]]; then
+        row=$(printf '%s\tERROR\t\t\t\t\t\tmissing_result' "$t")
+      else
+        row=$(printf '%s\n' "$line" | cut -f1-8)
+        id=$(printf '%s\n' "$line" | cut -f9)
+        if [[ -n "$id" ]]; then row=$(apply_probe "$row" "$id"); fi
+      fi
+      printf '%s\n' "$row" >> "$TSV"
+      # прогресс: в TTY перезаписываемая строка, вне TTY — редкие строки
+      if [[ $QUIET -eq 0 ]]; then
+        el=$(( $(date +%s) - start2 ))
+        eta="--"
+        if [[ $i -gt 0 ]]; then
+          es=$(( (el / i) * (TOTAL - i) ))
+          eta=$(printf '%dм%02dс' $((es / 60)) $((es % 60)))
+        fi
+        if [[ -t 1 ]]; then
+          printf '%s[зонды %d/%d · %02d:%02d · ETA %s] %s…%s\033[K\r' \
+            "$C_DIM" "$i" "$TOTAL" $((el / 60)) $((el % 60)) "$eta" "$t" "$C_RST"
+        elif [[ $((i % 10)) -eq 0 || "$i" -eq "$TOTAL" ]]; then
+          printf '[зонды %d/%d · %02d:%02d · ETA %s] %s\n' \
+            "$i" "$TOTAL" $((el / 60)) $((el % 60)) "$eta" "$t"
+        fi
+      fi
+    done <<< "$TARGETS"
   else
-    row=$(printf '%s\n' "$line" | cut -f1-8)
-    id=$(printf '%s\n' "$line" | cut -f9)
-  fi
-  if [[ $PROBE -eq 1 && "$id" != "" ]]; then
-    # прогресс только в интерактивном TTY и с очисткой строки, чтобы не слипалось
-    if [[ $QUIET -eq 0 && -t 1 ]]; then
-      printf '%s[зонды %d/%d] %s…%s\033[K\r' "$C_DIM" "$i" "$TOTAL" "$t" "$C_RST"
-    fi
-    row=$(apply_probe "$row" "$id")
-    if [[ $QUIET -eq 0 ]]; then
+    # ---- параллельно: буферизуем, показываем счётчик и печатаем по порядку ----
+    : > "$RESULTS_DIR/phase2.in"
+    i=0
+    while IFS= read -r t; do
+      i=$((i + 1))
+      line=$(awk -F'\t' -v t="$t" '$1 == t { print; exit }' "$RESULTS_DIR/parts.log")
+      if [[ -z "$line" ]]; then
+        printf '%s\tERROR\t\t\t\t\t\tmissing_result\n' "$t" >> "$RESULTS_DIR/phase2.raw"
+      else
+        printf '%s\n' "$line" >> "$RESULTS_DIR/phase2.in"
+      fi
+    done <<< "$TARGETS"
+    start2=$(date +%s)
+    pending=$(wc -l < "$RESULTS_DIR/phase2.in" | tr -d ' ')
+    if [[ -n "$pending" && "$pending" -gt 0 ]]; then
+      ticker2=""
+      if [[ $QUIET -eq 0 && -t 1 ]]; then
+        (
+          while :; do
+            dn=$(wc -l < "$RESULTS_DIR/phase2.raw" 2>/dev/null | tr -d ' ')
+            el=$(( $(date +%s) - start2 ))
+            printf '%s[зонды %d/%d · %02d:%02d]%s\033[K\r' \
+              "$C_DIM" "${dn:-0}" "$pending" $((el / 60)) $((el % 60)) "$C_RST"
+            sleep 1
+          done
+        ) &
+        ticker2=$!
+      fi
+      # xargs -0: элементы до NUL — табы внутри строки сохраняются (BSD xargs -I режет по табам)
+      tr '\n' '\0' < "$RESULTS_DIR/phase2.in" \
+        | xargs -0 -P "$PROBE_JOBS" -n1 bash -c 'apply_probe_line "$1"' _ \
+          >> "$RESULTS_DIR/phase2.raw"
+      if [[ -n "$ticker2" ]]; then kill "$ticker2" 2>/dev/null; wait "$ticker2" 2>/dev/null; fi
       [[ -t 1 ]] && printf '\033[K\r'
+    fi
+    # вывод в исходном порядке
+    i=0
+    while IFS= read -r t; do
+      i=$((i + 1))
+      row=$(awk -F'\t' -v t="$t" '$1 == t { print; exit }' "$RESULTS_DIR/phase2.raw")
+      if [[ -z "$row" ]]; then
+        row=$(printf '%s\tERROR\t\t\t\t\t\tmissing_result' "$t")
+      fi
+      printf '%s\n' "$row" >> "$TSV"
+      if [[ $QUIET -eq 0 ]]; then
+        st=$(printf '%s' "$row" | cut -f2)
+        case "$st" in
+          BLOCKED)  printf '%s%s%s %s\n' "$C_RED" "[BLOCKED]" "$C_RST" "$t" ;;
+          CLEAN)    printf '%s%s%s %s\n' "$C_GRN" "[CLEAN]  " "$C_RST" "$t" ;;
+          UNSTABLE) printf '%s%s%s %s\n' "$C_YEL" "[UNSTABLE]" "$C_RST" "$t" ;;
+          *)        printf '%s%s%s %s\n' "$C_YEL" "[ERROR]  " "$C_RST" "$t" ;;
+        esac
+      fi
+    done <<< "$TARGETS"
+  fi
+else
+  # ---- без зондов: печатаем результат списков как есть ----
+  i=0
+  while IFS= read -r t; do
+    i=$((i + 1))
+    line=$(awk -F'\t' -v t="$t" '$1 == t { print; exit }' "$RESULTS_DIR/parts.log")
+    if [[ -z "$line" ]]; then
+      row=$(printf '%s\tERROR\t\t\t\t\t\tmissing_result' "$t")
+    else
+      row=$(printf '%s\n' "$line" | cut -f1-8)
+    fi
+    printf '%s\n' "$row" >> "$TSV"
+    if [[ $QUIET -eq 0 ]]; then
       st=$(printf '%s' "$row" | cut -f2)
       case "$st" in
-        BLOCKED) printf '%s%s%s %s\n' "$C_RED" "[BLOCKED]" "$C_RST" "$t" ;;
-        CLEAN)   printf '%s%s%s %s\n' "$C_GRN" "[CLEAN]  " "$C_RST" "$t" ;;
+        BLOCKED)  printf '%s%s%s %s\n' "$C_RED" "[BLOCKED]" "$C_RST" "$t" ;;
+        CLEAN)    printf '%s%s%s %s\n' "$C_GRN" "[CLEAN]  " "$C_RST" "$t" ;;
         UNSTABLE) printf '%s%s%s %s\n' "$C_YEL" "[UNSTABLE]" "$C_RST" "$t" ;;
-        *)       printf '%s%s%s %s\n' "$C_YEL" "[ERROR]  " "$C_RST" "$t" ;;
+        *)        printf '%s%s%s %s\n' "$C_YEL" "[ERROR]  " "$C_RST" "$t" ;;
       esac
     fi
-  fi
-  printf '%s\n' "$row" >> "$TSV"
-done <<< "$TARGETS"
+  done <<< "$TARGETS"
+fi
 
 cut -f1,2 "$TSV" | awk -F'\t' '$2=="BLOCKED"{print $1}' > "$BLOCKED_F"
 cut -f1,2 "$TSV" | awk -F'\t' '$2=="CLEAN"{print $1}'   > "$CLEAN_F"
