@@ -24,6 +24,7 @@ DELAY=0.3             # пауза каждой воркер-границы, с�
 VERIFY=1              # проверок на один адрес (1 = один снимок; 2+ = повторная верификация)
 PROBE=1               # динамическая проверка зондами ТСПУ — ПО УМОЛЧАНИЮ ВКЛЮЧЕНА (-p); отключить: --no-probe
 PROBE_TIMEOUT=120     # сколько ждать ответы зондов, сек (при неполном ответе — reconnect)
+PROBE_MAX_WAIT=0      # максимум ждать вердикты зондов в доп. проходах, сек (0 = перепроверять до результата)
 PROBE_JOBS=1          # параллельность ЗОНДОВ: 1 = последовательно (надёжно, не упирается в лимиты);
                       # >1 = быстрее на больших списках, но возможны nodata → вердикт по спискам
 CSV=1                 # писать results.csv
@@ -57,6 +58,8 @@ usage() {
                 --probe-timeout SEC сколько ждать ответы зондов (по умолчанию: $PROBE_TIMEOUT)
                 --probe-jobs N      параллельно зондов на больших списках (по умолчанию: 1 =
                                     последовательно/надёжно; напр. 3-5 заметно быстрее)
+                --probe-max-wait SEC максимум ждать вердикты зондов, пока не ответят все
+                                    (0 = без лимита, перепроверять до итога; по умолчанию: $PROBE_MAX_WAIT)
   -q         тихий режим (только итог)
   -h         эта справка
 
@@ -79,6 +82,8 @@ while (( $# > 0 )); do
     --probe-timeout=*) PROBE_TIMEOUT="${a#*=}" ;;
     --probe-jobs)    PROBE_JOBS="$1"; shift ;;
     --probe-jobs=*)  PROBE_JOBS="${a#*=}" ;;
+    --probe-max-wait) PROBE_MAX_WAIT="$1"; shift ;;
+    --probe-max-wait=*) PROBE_MAX_WAIT="${a#*=}" ;;
     --no-probe)      PROBE=0 ;;
     --no-probe=*)    PROBE=0 ;;
     *) ARGS+=("$a") ;;
@@ -563,7 +568,7 @@ worker() {
   sleep "$DELAY"
 }
 export -f worker check_one parse_json poll_target blocked_of id_of run_probe probe_verdict apply_probe apply_probe_line 2>/dev/null || true
-export API_BASE PROBE_API RETRIES TIMEOUT DELAY VERIFY PROBE PROBE_TIMEOUT QUIET HAVE_JQ HAVE_PY
+export API_BASE PROBE_API RETRIES TIMEOUT DELAY VERIFY PROBE PROBE_TIMEOUT PROBE_MAX_WAIT QUIET HAVE_JQ HAVE_PY
 export C_RED C_GRN C_YEL C_RST
 export RESULTS_DIR
 
@@ -649,12 +654,18 @@ if [[ $PROBE -eq 1 ]]; then
       emit_status "$(printf '%s' "$row" | cut -f2)" "$t" "$i"
     done <<< "$TARGETS"
     # зонды молчали в первой волне (сервис перегружен, скан ещё не готов) —
-    # дожимаем дополнительными проходами со свежими id и паузой между ними
+    # дожимаем дополнительными проходами со свежими id, ПЕРЕПРОВЕРЯЯ ПОДРЯД,
+    # пока каждый адрес не получит вердикт (итог — только BLOCKED/CLEAN);
+    # --probe-max-wait ограничивает суммарное ожидание (0 = без лимита)
     sweep=0
-    while [[ $sweep -lt 3 ]]; do
+    probe_start=$(date +%s)
+    while : ; do
       [[ -s "$RESULTS_DIR/unresolved.txt" ]] || break
+      if [[ "$PROBE_MAX_WAIT" -gt 0 ]]; then
+        [[ $(( $(date +%s) - probe_start )) -lt "$PROBE_MAX_WAIT" ]] || break
+      fi
       sweep=$((sweep + 1))
-      sleep 5
+      sleep $((sweep * 6 > 60 ? 60 : sweep * 6))
       : > "$RESULTS_DIR/unresolved2.txt"
       : > "$RESULTS_DIR/unresolved_base2.txt"
       while IFS= read -r t; do
@@ -673,7 +684,8 @@ if [[ $PROBE -eq 1 ]]; then
       mv "$RESULTS_DIR/unresolved2.txt" "$RESULTS_DIR/unresolved.txt"
       mv "$RESULTS_DIR/unresolved_base2.txt" "$RESULTS_DIR/unresolved_base.txt"
     done
-    # кто так и не дал вердикта зондов — ERROR (в errors.txt на перепрогон)
+    # кто так и не дал вердикта зондов за --probe-max-wait — ERROR
+    # (по умолчанию 0 = без лимита: этот блок недостижим, итог только CLEAN/BLOCKED)
     while IFS= read -r t; do
       bow=$(awk -F'\t' -v t="$t" '$1 == t { print; exit }' "$RESULTS_DIR/unresolved_base.txt")
       [[ -z "$bow" ]] && bow="$t"
