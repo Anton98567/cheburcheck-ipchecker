@@ -376,7 +376,17 @@ probe_verdict() {
 # выход: строка с окончательным бинарным статусом (CLEAN/BLOCKED)
 apply_probe() {
   local row="$1" id="$2" tries=0 psum votes pver rest probe_note
-  [[ -z "$id" ]] && { printf '%s\n' "$row"; return 0; }
+  # id не получен (нет зондового запроса от /check) — строго: CLEAN без
+  # зондов не ставим, помечаем UNKNOWN (кроме уже-ошибок)
+  if [[ -z "$id" ]]; then
+    local st=$(printf '%s' "$row" | cut -f2)
+    if [[ "$st" != "ERROR" ]]; then
+      row=$(printf '%s' "$row" | awk -F'\t' 'BEGIN{OFS="\t"}
+          { $2="UNKNOWN"; $3=""; if ($8=="") $8="probe:no_id"; else $8=$8";probe:no_id"; print }')
+    fi
+    printf '%s\n' "$row"
+    return 0
+  fi
   while [[ $tries -lt 2 ]]; do
     psum=$(run_probe "$id" || true)
     votes=${psum#*|votes=}; votes=${votes%%|*}; votes=${votes:-0}
@@ -392,8 +402,33 @@ apply_probe() {
         printf '%s\n' "$row"
         return 0
         ;;
-      clean|whitelist)
-        probe_note="probe:ok;votes=${votes}"
+      clean)
+        # чистый вердикт НЕ окончательный: подтверждаем вторым независимым
+        # запросом (зонды флапают между сканами). если второй скан увидел
+        # блок — итог BLOCKED (как сайт: любой блокирующий вердикт)
+        probe_note="probe:ok;votes=${votes};$(printf '%s' "$psum" | sed 's/|votes=.*//;s/verdict=/pv=/')"
+        row=$(printf '%s' "$row" \
+          | awk -F'\t' -v n="$probe_note" 'BEGIN{OFS="\t"}
+              { if ($8=="") $8=n; else $8=$8";"n; print }')
+        target=$(printf '%s' "$row" | cut -f1)
+        nid=$(id_of "$(poll_target "$target" || true)" || true)
+        if [[ -n "$nid" ]]; then
+          psum2=$(run_probe "$nid" || true)
+          pver2=$(probe_verdict "$psum2" || true)
+          if [[ "$pver2" == blocked:* ]]; then
+            rest=${pver2#blocked:}
+            votes2=${psum2#*|votes=}; votes2=${votes2%%|*}
+            probe_note2="probe:${rest};votes=${votes2};$(printf '%s' "$psum2" | sed 's/|votes=.*//;s/verdict=/pv=/')"
+            row=$(printf '%s' "$row" \
+              | awk -F'\t' -v n="$probe_note2" 'BEGIN{OFS="\t"}
+                  { $2="BLOCKED"; $3="true"; if ($8=="") $8=n; else $8=$8";"n; print }')
+          fi
+        fi
+        printf '%s\n' "$row"
+        return 0
+        ;;
+      whitelist)
+        probe_note="probe:ok;votes=${votes};whitelist"
         row=$(printf '%s' "$row" \
           | awk -F'\t' -v n="$probe_note" 'BEGIN{OFS="\t"}
               { if ($8=="") $8=n; else $8=$8";"n; print }')
@@ -420,6 +455,12 @@ apply_probe() {
         ;;
     esac
   done
+  # цикл исчерпан без вердикта зондов — СТРОГО: не CLEAN/BLOCKED по спискам
+  row=$(printf '%s' "$row" \
+    | awk -F'\t' 'BEGIN{OFS="\t"}
+        { ls=$2; $2="UNKNOWN"; $3="";
+          n="probe:no_response;list=" ls;
+          if ($8=="") $8=n; else $8=$8";"n; print }')
   printf '%s\n' "$row"
 }
 
@@ -583,7 +624,7 @@ if [[ $PROBE -eq 1 ]]; then
       else
         row=$(printf '%s\n' "$line" | cut -f1-8)
         id=$(printf '%s\n' "$line" | cut -f9)
-        if [[ -n "$id" ]]; then row=$(apply_probe "$row" "$id"); fi
+        row=$(apply_probe "$row" "$id")
       fi
       printf '%s\n' "$row" >> "$TSV"
       # каждая строка = результат адреса (классический вид: [BLOCKED] адрес)
