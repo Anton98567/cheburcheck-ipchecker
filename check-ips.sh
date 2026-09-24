@@ -294,7 +294,7 @@ except Exception: print("")' 2>/dev/null || echo ""
 # с возрастающей паузой (лимиты сервиса). Отдаёт сводку:
 #  verdict=<число>;...|votes=<N>|online=<M>
 run_probe() {
-  local id="$1" tmp tries=0 max_tries=3
+  local id="$1" tmp tries=0 max_tries=6
   [[ -z "$id" ]] && { echo ""; return 0; }
   tmp=$(mktemp "${RESULTS_DIR}/probe.XXXXXX")
   while [[ $tries -lt $max_tries ]]; do
@@ -302,21 +302,20 @@ run_probe() {
          -H 'Accept: text/event-stream' \
          -H 'User-Agent: check-ips.sh/2.0 probe' \
          -- "$PROBE_API/$id" > "$tmp" 2>/dev/null
-    # мгновенный отказ сервиса (429/ошибка/пусто) — реконнекты бессмысленны,
-    # вердикт вынесет список; не тратим НИ СЕКУНДЫ на повторные подключения
-    if grep -qE '"code"[[:space:]]*:[[:space:]]*[45][0-9]{2}|event:error' "$tmp" 2>/dev/null \
-       || [[ ! -s "$tmp" ]]; then
+    # ЯВНАЯ ошибка сервиса (429/404/event:error) — реконнекты не помогут
+    if grep -qE '"code"[[:space:]]*:[[:space:]]*[45][0-9]{2}|event:error' "$tmp" 2>/dev/null; then
       echo ""
       rm -f "$tmp"
       return 0
     fi
-    # успех: сервер прислал финальный done ИЛИ хотя бы какие-то вердикты
+    # сервер прислал вердикты (event:result) — стрим завершён
     if grep -q 'event:result' "$tmp" 2>/dev/null; then
       break
     fi
-    # тишина (очередь/обрыв) — переподключаемся к тому же id после короткой паузы
+    # пусто/обрыв/тишина: скан, скорее всего, ещё НЕ готов (очередь зондов
+    # под нагрузкой) — ждём и переподключаемся к ТОМУ ЖЕ id, а не сдаёмся
     tries=$((tries + 1))
-    [[ $tries -lt $max_tries ]] && sleep 3
+    [[ $tries -lt $max_tries ]] && sleep 4
   done
   # подсчёт вердиктов по строкам data: (малыми порциями, чтобы не съесть память)
   awk '/^data:/{ a=substr($0,6); if (index(a,"verdicts")>0) print a }' "$tmp" \
@@ -614,31 +613,76 @@ fi
 if [[ $PROBE -eq 1 ]]; then
   if [[ "$PROBE_JOBS" -le 1 ]]; then
     # ---- последовательно: проверяем и печатаем РЕЗУЛЬТАТЫ по мере готовности ----
+    # итог ТОЛЬКО CLEAN/BLOCKED (решает зондирование); если зонды молчат —
+    # дожимаем доп. проходами со свежими id; не ответившие → ERROR (не UNKNOWN)
+    emit_status() { # $1=статус $2=адрес $3=номер
+      [[ $QUIET -eq 0 ]] || return 0
+      local d=$3; [[ $d -gt $TOTAL ]] && d=$TOTAL
+      case "$1" in
+        BLOCKED)  printf '%s%s%s %s%s%s%s\n' "$C_RED" "[BLOCKED]" "$C_RST" "$2" "$C_DIM" " [$d/$TOTAL]" "$C_RST" ;;
+        CLEAN)    printf '%s%s%s %s%s%s%s\n' "$C_GRN" "[CLEAN]  " "$C_RST" "$2" "$C_DIM" " [$d/$TOTAL]" "$C_RST" ;;
+        UNSTABLE) printf '%s%s%s %s%s%s%s\n' "$C_YEL" "[UNSTABLE]" "$C_RST" "$2" "$C_DIM" " [$d/$TOTAL]" "$C_RST" ;;
+        *)        printf '%s%s%s %s%s%s%s\n' "$C_YEL" "[ERROR]  " "$C_RST" "$2" "$C_DIM" " [$d/$TOTAL]" "$C_RST" ;;
+      esac
+    }
     start2=$(date +%s)
     i=0
+    : > "$RESULTS_DIR/unresolved.txt"
+    : > "$RESULTS_DIR/unresolved_base.txt"
     while IFS= read -r t; do
       i=$((i + 1))
       line=$(awk -F'\t' -v t="$t" '$1 == t { print; exit }' "$RESULTS_DIR/parts.log")
       if [[ -z "$line" ]]; then
         row=$(printf '%s\tERROR\t\t\t\t\t\tmissing_result' "$t")
-      else
-        row=$(printf '%s\n' "$line" | cut -f1-8)
-        id=$(printf '%s\n' "$line" | cut -f9)
-        row=$(apply_probe "$row" "$id")
+        printf '%s\n' "$row" >> "$TSV"
+        emit_status "ERROR" "$t" "$i"
+        continue
+      fi
+      bow=$(printf '%s\n' "$line" | cut -f1-8)
+      row=$(apply_probe "$bow" "$(printf '%s\n' "$line" | cut -f9)")
+      if [[ "$(printf '%s' "$row" | cut -f2)" == "UNKNOWN" ]]; then
+        printf '%s\n' "$t" >> "$RESULTS_DIR/unresolved.txt"
+        printf '%s\n' "$bow" >> "$RESULTS_DIR/unresolved_base.txt"
+        continue
       fi
       printf '%s\n' "$row" >> "$TSV"
-      # каждая строка = результат адреса (классический вид: [BLOCKED] адрес)
-      if [[ $QUIET -eq 0 ]]; then
-        st=$(printf '%s' "$row" | cut -f2)
-        case "$st" in
-          BLOCKED)  printf '%s%s%s %s%s%s%s\n' "$C_RED" "[BLOCKED]" "$C_RST" "$t" "$C_DIM" " [$i/$TOTAL]" "$C_RST" ;;
-          CLEAN)    printf '%s%s%s %s%s%s%s\n' "$C_GRN" "[CLEAN]  " "$C_RST" "$t" "$C_DIM" " [$i/$TOTAL]" "$C_RST" ;;
-          UNSTABLE) printf '%s%s%s %s%s%s%s\n' "$C_YEL" "[UNSTABLE]" "$C_RST" "$t" "$C_DIM" " [$i/$TOTAL]" "$C_RST" ;;
-          UNKNOWN)  printf '%s%s%s %s%s%s%s\n' "$C_YEL" "[UNKNOWN]" "$C_RST" "$t" "$C_DIM" " [$i/$TOTAL]" "$C_RST" ;;
-          *)        printf '%s%s%s %s%s%s%s\n' "$C_YEL" "[ERROR]  " "$C_RST" "$t" "$C_DIM" " [$i/$TOTAL]" "$C_RST" ;;
-        esac
-      fi
+      emit_status "$(printf '%s' "$row" | cut -f2)" "$t" "$i"
     done <<< "$TARGETS"
+    # зонды молчали в первой волне (сервис перегружен, скан ещё не готов) —
+    # дожимаем дополнительными проходами со свежими id и паузой между ними
+    sweep=0
+    while [[ $sweep -lt 3 ]]; do
+      [[ -s "$RESULTS_DIR/unresolved.txt" ]] || break
+      sweep=$((sweep + 1))
+      sleep 5
+      : > "$RESULTS_DIR/unresolved2.txt"
+      : > "$RESULTS_DIR/unresolved_base2.txt"
+      while IFS= read -r t; do
+        bow=$(awk -F'\t' -v t="$t" '$1 == t { print; exit }' "$RESULTS_DIR/unresolved_base.txt")
+        [[ -z "$bow" ]] && bow="$t"
+        row2=$(apply_probe "$bow" "$(id_of "$(poll_target "$t" || true)" || true)")
+        if [[ "$(printf '%s' "$row2" | cut -f2)" == "UNKNOWN" ]]; then
+          printf '%s\n' "$t" >> "$RESULTS_DIR/unresolved2.txt"
+          printf '%s\n' "$bow" >> "$RESULTS_DIR/unresolved_base2.txt"
+        else
+          i=$((i + 1))
+          printf '%s\n' "$row2" >> "$TSV"
+          emit_status "$(printf '%s' "$row2" | cut -f2)" "$t" "$i"
+        fi
+      done < "$RESULTS_DIR/unresolved.txt"
+      mv "$RESULTS_DIR/unresolved2.txt" "$RESULTS_DIR/unresolved.txt"
+      mv "$RESULTS_DIR/unresolved_base2.txt" "$RESULTS_DIR/unresolved_base.txt"
+    done
+    # кто так и не дал вердикта зондов — ERROR (в errors.txt на перепрогон)
+    while IFS= read -r t; do
+      bow=$(awk -F'\t' -v t="$t" '$1 == t { print; exit }' "$RESULTS_DIR/unresolved_base.txt")
+      [[ -z "$bow" ]] && bow="$t"
+      row=$(printf '%s' "$bow" | awk -F'\t' -v n="no_verdict_after_probes" 'BEGIN{OFS="\t"}
+            { $2="ERROR"; $3=""; if ($8=="") $8=n; else $8=$8";"n; print }')
+      i=$((i + 1))
+      printf '%s\n' "$row" >> "$TSV"
+      emit_status "ERROR" "$t" "$i"
+    done < "$RESULTS_DIR/unresolved.txt"
   else
     # ---- параллельно: буферизуем, показываем счётчик и печатаем по порядку ----
     : > "$RESULTS_DIR/phase2.in"
