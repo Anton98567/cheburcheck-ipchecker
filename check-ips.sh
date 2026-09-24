@@ -401,18 +401,20 @@ apply_probe() {
         return 0
         ;;
       *)
-        # nodata: зонды не ответили (обычно 429/лимит сервиса) — возвращаем
-        # вердикт списков ИТОГОМ (как до строгого режима), а в detail помечаем
-        # «probe:no_response», чтобы было видно, что зонды не участвовали
+        # nodata: зонды не дали вердикта (обычно 429/лимит) — СТРОГО:
+        # адрес НЕ помечаем CLEAN/BLOCKED по спискам, ставим UNKNOWN,
+        # а вердикт списка сохраняем в detail для справки
         tries=$((tries + 1))
-        if [[ $tries -eq 1 ]]; then
+        if [[ $tries -lt 3 ]]; then
           sleep 2
           id=$(id_of "$(RETRIES=1 poll_target "$(printf '%s' "$row" | cut -f1)" || true)")
-          continue
+          [[ -n "$id" ]] && continue
         fi
         row=$(printf '%s' "$row" \
-          | awk -F'\t' -v n="probe:no_response" 'BEGIN{OFS="\t"}
-              { if ($8=="") $8=n; else $8=$8";"n; print }')
+          | awk -F'\t' 'BEGIN{OFS="\t"}
+              { ls=$2; $2="UNKNOWN"; $3="";
+                n="probe:no_response;list=" ls;
+                if ($8=="") $8=n; else $8=$8";"n; print }')
         printf '%s\n' "$row"
         return 0
         ;;
