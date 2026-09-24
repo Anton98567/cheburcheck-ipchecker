@@ -545,30 +545,34 @@ fi
 
 # ---------- ЭТАП 1: списки (параллельно) ----------
 start1=$(date +%s)
-# «живой» счётчик этапа 1 — чтобы при большом списке было видно, что идёт работа
-ticker1=""
-if [[ $PROBE -eq 1 && $QUIET -eq 0 && -t 1 ]]; then
-  (
-    while :; do
-      n=$(wc -l < "$RESULTS_DIR/parts.log" 2>/dev/null | tr -d ' ')
-      el=$(( $(date +%s) - start1 ))
-      printf '%s[списки %d/%d · %02d:%02d]%s\033[K\r' \
-        "$C_DIM" "${n:-0}" "$TOTAL" $((el / 60)) $((el % 60)) "$C_RST"
-      sleep 1
-    done
-  ) &
-  ticker1=$!
+# этап 1: запускаем xargs-пайплайн в фоне и опрашиваем из главного процесса —
+# НИКАКИХ фоновых циклов с kill (дают SIGTERM в этом окружении shell)
+if [[ $PROBE -eq 1 && $QUIET -eq 0 ]]; then
+  step=2; [[ -t 1 ]] || step=5
+  ( printf '%s\n' "$TARGETS" \
+      | xargs -P "$JOBS" -I{} -n1 bash -c 'worker "$@"' _ {} ) &
+  xpid=$!
+  while kill -0 "$xpid" 2>/dev/null; do
+    n=$(wc -l < "$RESULTS_DIR/parts.log" 2>/dev/null | tr -d ' ')
+    el=$(( $(date +%s) - start1 ))
+    printf '%s[списки %d/%d · %02d:%02d]%s\n' \
+      "$C_DIM" "${n:-0}" "$TOTAL" $((el / 60)) $((el % 60)) "$C_RST"
+    sleep "$step"
+  done
+  wait "$xpid"
+  el=$(( $(date +%s) - start1 ))
+  printf '%s[списки %d/%d · готово за %02d:%02d]%s\n' \
+    "$C_DIM" "$TOTAL" "$TOTAL" $((el / 60)) $((el % 60)) "$C_RST"
+else
+  printf '%s\n' "$TARGETS" \
+    | xargs -P "$JOBS" -I{} -n1 bash -c 'worker "$@"' _ {}
 fi
-printf '%s\n' "$TARGETS" \
-  | xargs -P "$JOBS" -I{} -n1 bash -c 'worker "$@"' _ {}
-if [[ -n "$ticker1" ]]; then kill "$ticker1" 2>/dev/null; wait "$ticker1" 2>/dev/null; fi
-[[ $QUIET -eq 0 && -t 1 ]] && printf '\033[K\r'
 
 # ---------- ЭТАП 2: зонды + сборка в порядке входного списка ----------
 : > "$TSV"
 if [[ $PROBE -eq 1 ]]; then
   if [[ "$PROBE_JOBS" -le 1 ]]; then
-    # ---- последовательно: проверяем и печатаем по мере готовности ----
+    # ---- последовательно: проверяем и печатаем РЕЗУЛЬТАТЫ по мере готовности ----
     start2=$(date +%s)
     i=0
     while IFS= read -r t; do
@@ -582,21 +586,16 @@ if [[ $PROBE -eq 1 ]]; then
         if [[ -n "$id" ]]; then row=$(apply_probe "$row" "$id"); fi
       fi
       printf '%s\n' "$row" >> "$TSV"
-      # прогресс: в TTY перезаписываемая строка, вне TTY — редкие строки
+      # каждая строка = результат адреса (классический вид: [BLOCKED] адрес)
       if [[ $QUIET -eq 0 ]]; then
-        el=$(( $(date +%s) - start2 ))
-        eta="--"
-        if [[ $i -gt 0 ]]; then
-          es=$(( (el / i) * (TOTAL - i) ))
-          eta=$(printf '%dм%02dс' $((es / 60)) $((es % 60)))
-        fi
-        if [[ -t 1 ]]; then
-          printf '%s[зонды %d/%d · %02d:%02d · ETA %s] %s…%s\033[K\r' \
-            "$C_DIM" "$i" "$TOTAL" $((el / 60)) $((el % 60)) "$eta" "$t" "$C_RST"
-        elif [[ $((i % 10)) -eq 0 || "$i" -eq "$TOTAL" ]]; then
-          printf '[зонды %d/%d · %02d:%02d · ETA %s] %s\n' \
-            "$i" "$TOTAL" $((el / 60)) $((el % 60)) "$eta" "$t"
-        fi
+        st=$(printf '%s' "$row" | cut -f2)
+        case "$st" in
+          BLOCKED)  printf '%s%s%s %s%s%s%s\n' "$C_RED" "[BLOCKED]" "$C_RST" "$t" "$C_DIM" " [$i/$TOTAL]" "$C_RST" ;;
+          CLEAN)    printf '%s%s%s %s%s%s%s\n' "$C_GRN" "[CLEAN]  " "$C_RST" "$t" "$C_DIM" " [$i/$TOTAL]" "$C_RST" ;;
+          UNSTABLE) printf '%s%s%s %s%s%s%s\n' "$C_YEL" "[UNSTABLE]" "$C_RST" "$t" "$C_DIM" " [$i/$TOTAL]" "$C_RST" ;;
+          UNKNOWN)  printf '%s%s%s %s%s%s%s\n' "$C_YEL" "[UNKNOWN]" "$C_RST" "$t" "$C_DIM" " [$i/$TOTAL]" "$C_RST" ;;
+          *)        printf '%s%s%s %s%s%s%s\n' "$C_YEL" "[ERROR]  " "$C_RST" "$t" "$C_DIM" " [$i/$TOTAL]" "$C_RST" ;;
+        esac
       fi
     done <<< "$TARGETS"
   else
@@ -615,25 +614,22 @@ if [[ $PROBE -eq 1 ]]; then
     start2=$(date +%s)
     pending=$(wc -l < "$RESULTS_DIR/phase2.in" | tr -d ' ')
     if [[ -n "$pending" && "$pending" -gt 0 ]]; then
-      ticker2=""
-      if [[ $QUIET -eq 0 && -t 1 ]]; then
-        (
-          while :; do
-            dn=$(wc -l < "$RESULTS_DIR/phase2.raw" 2>/dev/null | tr -d ' ')
-            el=$(( $(date +%s) - start2 ))
-            printf '%s[зонды %d/%d · %02d:%02d]%s\033[K\r' \
-              "$C_DIM" "${dn:-0}" "$pending" $((el / 60)) $((el % 60)) "$C_RST"
-            sleep 1
-          done
-        ) &
-        ticker2=$!
-      fi
       # xargs -0: элементы до NUL — табы внутри строки сохраняются (BSD xargs -I режет по табам)
-      tr '\n' '\0' < "$RESULTS_DIR/phase2.in" \
-        | xargs -0 -P "$PROBE_JOBS" -n1 bash -c 'apply_probe_line "$1"' _ \
-          >> "$RESULTS_DIR/phase2.raw"
-      if [[ -n "$ticker2" ]]; then kill "$ticker2" 2>/dev/null; wait "$ticker2" 2>/dev/null; fi
-      [[ -t 1 ]] && printf '\033[K\r'
+      ( tr '\n' '\0' < "$RESULTS_DIR/phase2.in" \
+          | xargs -0 -P "$PROBE_JOBS" -n1 bash -c 'apply_probe_line "$1"' _ \
+            >> "$RESULTS_DIR/phase2.raw" ) &
+      xp2=$!
+      if [[ $QUIET -eq 0 ]]; then
+        step=2; [[ -t 1 ]] || step=5
+        while kill -0 "$xp2" 2>/dev/null; do
+          dn=$(wc -l < "$RESULTS_DIR/phase2.raw" 2>/dev/null | tr -d ' ')
+          el=$(( $(date +%s) - start2 ))
+          printf '%s[зонды %d/%d · %02d:%02d]%s\n' \
+            "$C_DIM" "${dn:-0}" "$pending" $((el / 60)) $((el % 60)) "$C_RST"
+          sleep "$step"
+        done
+      fi
+      wait "$xp2"
     fi
     # вывод в исходном порядке
     i=0
