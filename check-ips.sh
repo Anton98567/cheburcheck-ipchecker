@@ -137,6 +137,23 @@ fi
 TARGETS=$(printf '%s\n' "$RAW" \
   | sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
   | grep -E . || true)
+# раскрытие IPv4-подсетей /24 (256 адресов) и мельче (/25=128, /26=64, ..., /32=1)
+# в отдельные адреса, чтобы каждый проверялся ЗОНДАМИ ТСПУ, а не только по спискам.
+# Блоки крупнее /24 (>256 адресов) НЕ раскрываются: остаются подсетью и проверяются
+# по спискам (как раньше), с предупреждением в stderr.
+TARGETS=$(printf '%s\n' "$TARGETS" | awk '
+  function ip2n(s,  a){ split(s,a,"."); return a[1]*16777216 + a[2]*65536 + a[3]*256 + a[4] }
+  function n2ip(n){ return sprintf("%d.%d.%d.%d", int(n/16777216)%256, int(n/65536)%256, int(n/256)%256, n%256) }
+  /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\/[0-9]{1,2}$/ {
+    split($0, p, "/"); pref=p[2]+0
+    if (pref>=24 && pref<=32) {
+      n=ip2n(p[1]); cnt=2^(32-pref); for(i=0;i<cnt;i++) print n2ip(n+i); next
+    }
+    if (pref<24) print "ВНИМАНИЕ: "$0" — блок крупнее /24 ("2^(32-pref)" адресов), раскрытие не делаю; проверяется по спискам как подсеть" > "/dev/stderr"
+    print; next
+  }
+  { print }
+')
 # дедупликация, сохраняя порядок
 TARGETS=$(printf '%s\n' "$TARGETS" | awk '!seen[$0]++')
 
@@ -553,18 +570,8 @@ worker() {
   local target="$1" res
   res=$(check_one "$target")
   printf '%s\n' "$res" >> "$RESULTS_DIR/parts.log"
-  # при включённых зондах построчный вывод делает ВТОРАЯ фаза (после зондов),
-  # чтобы не показывать промежуточный статус по спискам
-  if [[ $QUIET -eq 0 && $PROBE -eq 0 ]]; then
-    local st
-    st=$(printf '%s' "$res" | cut -f2)
-    case "$st" in
-      BLOCKED) printf '%s%s%s %s\n' "$C_RED" "[BLOCKED]" "$C_RST" "$target" ;;
-      CLEAN)   printf '%s%s%s %s\n' "$C_GRN" "[CLEAN]  " "$C_RST" "$target" ;;
-      UNSTABLE) printf '%s%s%s %s\n' "$C_YEL" "[UNSTABLE]" "$C_RST" "$target" ;;
-      *)       printf '%s%s%s %s\n' "$C_YEL" "[ERROR]  " "$C_RST" "$target" ;;
-    esac
-  fi
+  # построчный вывод делает финальная сборка (по порядку входного списка),
+  # чтобы адрес не печатался дважды (здесь и в сборке)
   sleep "$DELAY"
 }
 export -f worker check_one parse_json poll_target blocked_of id_of run_probe probe_verdict apply_probe apply_probe_line 2>/dev/null || true
