@@ -720,9 +720,8 @@ if [[ $PROBE -eq 1 ]]; then
     if [[ -n "$pending" && "$pending" -gt 0 ]]; then
       # xargs -0: элементы до NUL — табы внутри строки сохраняются (BSD xargs -I режет по табам)
       ( tr '\n' '\0' < "$RESULTS_DIR/phase2.in" \
-          | xargs -0 -P "$PROBE_JOBS" -n1 bash -c 'apply_probe_line "$1"' _ \
-            >> "$RESULTS_DIR/phase2.raw" ) &
-      xp2=$!
+          | xargs -0 -P "$PROBE_JOBS" -n1 bash -c 'apply_probe_line "$1" | flock "$RESULTS_DIR/phase2.lock" cat >> "$RESULTS_DIR/phase2.raw"' _ \
+            ) &
       if [[ $QUIET -eq 0 ]]; then
         step=2; [[ -t 1 ]] || step=5
         while kill -0 "$xp2" 2>/dev/null; do
